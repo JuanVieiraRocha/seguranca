@@ -6,6 +6,7 @@ package proj2
 import (
 	// Você pode obter os pacotes necessários com
 	// go mod download
+
 	"github.com/RafaelTupynamba/Projeto2/userlib"
 
 	// A vida fica muito mais fácil com json: você
@@ -214,11 +215,13 @@ func (userdata *User) StoreFile(filename string, data []byte) {
 	if HMAErr != nil {
 		return
 	}
+
+	// chaves do arquivo
 	fileUUID := bytesToUUID(chaveDeArquivo[:16])
 
 	// Criptografando Data
 	iv := userlib.RandomBytes(userlib.AESBlockSize)
-	cipherText := userlib.SymEnc(chaveDeArquivo, iv, data)
+	cipherText := userlib.SymEnc(chaveDeArquivo[:16], iv, data)
 
 	// Salvando a data
 
@@ -233,6 +236,42 @@ func (userdata *User) StoreFile(filename string, data []byte) {
 // e metadados necessários.
 
 func (userdata *User) AppendFile(filename string, data []byte) (err error) {
+	// Chaves de identificação
+	fileSpecificUser := []byte(userdata.Username + ":" + filename)
+	chaveDeArquivo, HMAErr := userlib.HMACEval(userdata.Salt, fileSpecificUser)
+	if HMAErr != nil {
+		return HMAErr
+	}
+	fileUUID := bytesToUUID(chaveDeArquivo[16:32])
+	chaveDeAdicao := bytesToUUID(chaveDeArquivo[:16])
+	fileKey := chaveDeArquivo[:16]
+
+	// Descriptografando data
+	nomeEncriptado, exists := userlib.DatastoreGet(fileUUID)
+	if !exists {
+		return errors.New("arquivo Inexistente")
+	}
+	plainText := userlib.SymDec(fileKey, nomeEncriptado)
+	if len(plainText) == 0 {
+		return errors.New("Arquivo ou metadados corrompidos")
+	}
+	// Salvando dados
+	iv := userlib.RandomBytes(userlib.AESBlockSize)
+	userlib.DatastoreSet(
+		chaveDeAdicao,
+		userlib.SymEnc(fileKey, iv, data),
+	)
+
+	novoNome, err := json.Marshal(plainText)
+	if err != nil {
+		return err
+	}
+
+	iv = userlib.RandomBytes(userlib.AESBlockSize)
+	userlib.DatastoreSet(
+		fileUUID,
+		userlib.SymEnc(fileKey, iv, novoNome),
+	)
 	return
 }
 
