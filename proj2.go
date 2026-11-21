@@ -80,8 +80,9 @@ func bytesToUUID(data []byte) (ret uuid.UUID) {
 // Definição de estrutura para um registro de usuário
 type User struct {
 	Username        string
+	Passowrd        string
 	Uuid            userlib.UUID
-	UhaveEncriptada userlib.PKEDecKey
+	ChaveEncriptada userlib.PKEDecKey
 	Assinatura      userlib.DSSignKey
 	Salt            []byte
 	// Você pode adicionar outros campos aqui, se quiser...
@@ -105,10 +106,9 @@ type User struct {
 
 // Pode-se assumir que o usuário possui uma senha FORTE
 func InitUser(username string, password string) (userdataptr *User, err error) {
-	// Erros localizados como <nomeDaFunção>err
-	var userdata User
-	userdataptr = &userdata
+	var usuarioLogado User
 
+	// Verifica se há usuario e senha
 	if username == "" {
 		return nil, errors.New("Usuário Vazio")
 	}
@@ -130,38 +130,43 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 
 	// Identidade RSA, para acessar posteriormente
 
-	_, decriptedres, keyErr := userlib.PKEKeyGen()
-	signKey, verifyKey, sigErr := userlib.DSKeyGen()
-	if keyErr != nil {
-		return nil, keyErr
+	// Chave de criptografia
+	_, decriptedres, err := userlib.PKEKeyGen()
+	if err != nil {
+		return nil, err
 	}
-	if sigErr != nil {
-		return nil, sigErr
+
+	// Chave de descriptografia
+	signKey, verifyKey, err := userlib.DSKeyGen()
+	if err != nil {
+		return nil, err
 	}
 
 	// Salvando usuário
-	userdata.Username = username
-	userdata.Uuid = userUUID
-	userdata.UhaveEncriptada = decriptedres
-	userdata.Assinatura = signKey
-	userdata.Salt = salt
+	usuarioLogado.Username = username
+	usuarioLogado.Passowrd = password
+	usuarioLogado.Uuid = userUUID
+	usuarioLogado.ChaveEncriptada = decriptedres
+	usuarioLogado.Assinatura = signKey
+	usuarioLogado.Salt = key
 
 	// Salvando chave de recuperação
 
 	userlib.KeystoreSet(username, verifyKey)
 
 	// Transforma usuário em JSON, IV aleatório, criptografar JSON
-	userSerialized, JSONerr := json.Marshal(userdataptr)
-	iv := userlib.RandomBytes(userlib.AESBlockSize)
-	if JSONerr != nil {
-		return nil, JSONerr
+	userSerialized, err := json.Marshal(usuarioLogado)
+	if err != nil {
+		return nil, err
 	}
+
+	iv := userlib.RandomBytes(userlib.AESBlockSize)
 	cipherText := userlib.SymEnc(key, iv, userSerialized)
 
 	// Armazenando
 	userlib.DatastoreSet(userUUID, cipherText)
 
-	return &userdata, nil
+	return &usuarioLogado, nil
 }
 
 // Isso recupera as informações do usuário do Datastore.
@@ -169,34 +174,38 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 // se os dados do usuário estiverem corrompidos,
 // ou se o usuário não for encontrado.
 func GetUser(username string, password string) (userdataptr *User, err error) {
-	var userdata User
-	userdataptr = &userdata
+	var usuarioLogado User
+
+	// erro: Usuário ou senha inválido
+	if usuarioLogado.Username != username || usuarioLogado.Passowrd != password {
+		return nil, errors.New("Usuário ou senha inválidos")
+	}
 
 	// Derivando UUID
 	salt := []byte(username)
 	key := userlib.Argon2Key([]byte(password), salt, uint32(userlib.AESKeySize))
-	res, HMACEerr := userlib.HMACEval(key, []byte(username)) // Pesquisar o que é a RES
-	if HMACEerr != nil {
-		return nil, HMACEerr
+	res, err := userlib.HMACEval(key, []byte(username)) // Pesquisar o que é a RES
+
+	if err != nil {
+		return nil, err
 	}
+
 	// cria o userUUID
 	userUUID := bytesToUUID(res)
-	// Buscando o usuário no store
-	cipherText, ok := userlib.DatastoreGet(userUUID)
-	if ok != true {
-		return nil, errors.New("Valor inexistente")
-	}
-
-	// Descriptografando dados
-	plainText := userlib.SymDec(key, cipherText) // Retorna um byte, que é o ciphertext;plaintext
 
 	// Verificando se a senha está correta
-	JSONerror := json.Unmarshal(plainText, userdataptr)
+	JSONerror := json.Unmarshal(plainText, &usuarioLogado)
 	if JSONerror != nil {
-		return nil, errors.New("senha ou dados inválidos")
+		return nil, errors.New("senha ou usuário inválidos")
 	}
+	cipherText, ok := userlib.DatastoreGet(userUUID)
 
-	return userdataptr, nil
+	if !ok {
+		return nil, errors.New("Dados de usuário não encontrados")
+	}
+	plainText := userlib.SymDec(key, cipherText) // Retorna um byte, que é o ciphertext;plaintext
+
+	return &usuarioLogado, nil
 }
 
 // Isso armazena um arquivo no datastore.
@@ -211,8 +220,9 @@ func (userdata *User) StoreFile(filename string, data []byte) {
 
 	// Chave especial
 	fileSpecificUser := []byte(userdata.Username + ":" + filename)
-	chaveDeArquivo, HMAErr := userlib.HMACEval(userdata.Salt, fileSpecificUser)
-	if HMAErr != nil {
+	chaveDeArquivo, err := userlib.HMACEval(userdata.Salt, fileSpecificUser)
+
+	if err != nil {
 		return
 	}
 
@@ -255,6 +265,7 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 	if len(plainText) == 0 {
 		return errors.New("Arquivo ou metadados corrompidos")
 	}
+
 	// Salvando dados
 	iv := userlib.RandomBytes(userlib.AESBlockSize)
 	userlib.DatastoreSet(
@@ -285,7 +296,7 @@ func (userdata *User) LoadFile(filename string) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-
+	// Cenário Benigno
 	fileKey := chaveDeArquivo[:16]
 	appendUUID := bytesToUUID(chaveDeArquivo[16:32])
 
