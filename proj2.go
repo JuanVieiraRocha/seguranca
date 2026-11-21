@@ -279,8 +279,44 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 //
 // Deve retornar um erro se o arquivo estiver corrompido de qualquer forma.
 func (userdata *User) LoadFile(filename string) (data []byte, err error) {
+	// Encontrando usuário e gerando as chaves de acesso
+	fileSpecificUser := []byte(userdata.Username + ":" + filename)
+	chaveDeArquivo, err := userlib.HMACEval(userdata.Salt, fileSpecificUser)
+	if err != nil {
+		return nil, err
+	}
 
-	return
+	fileKey := chaveDeArquivo[:16]
+	appendUUID := bytesToUUID(chaveDeArquivo[16:32])
+
+	// Obtendo e descriptando data
+	ciphertext, exists := userlib.DatastoreGet(appendUUID)
+	if !exists {
+		return nil, nil
+	}
+
+	headerJSON := userlib.SymDec(fileKey, ciphertext)
+
+	type fileHeader struct {
+		Blocks []uuid.UUID
+	}
+
+	var header fileHeader
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return nil, errors.New("Arquivo ou Metadados Corrompidos")
+	}
+
+	var result []byte
+	for _, blockUUID := range header.Blocks {
+		ciphertext, exists := userlib.DatastoreGet(blockUUID)
+		if !exists {
+			return nil, errors.New("Arquivo Corrompido")
+		}
+
+		result = append(result, userlib.SymDec(fileKey, ciphertext)...)
+	}
+
+	return result, nil
 }
 
 // Você pode querer definir o que exatamente deseja passar como
