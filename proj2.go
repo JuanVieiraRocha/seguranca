@@ -118,8 +118,8 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 
 	// userlib, linha 31, 58, 277, 305
 
-	salt := []byte(username)
-	key := userlib.Argon2Key([]byte(password), salt, uint32(userlib.AESKeySize))
+	key := userlib.Argon2Key([]byte(password), []byte(username), uint32(userlib.AESKeySize))
+
 	res, HMACEerr := userlib.HMACEval(key, []byte(username)) // Pesquisar o que é a RES
 	if HMACEerr != nil {
 		return nil, HMACEerr
@@ -155,16 +155,25 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	userlib.KeystoreSet(username, verifyKey)
 
 	// Transforma usuário em JSON, IV aleatório, criptografar JSON
+
 	userSerialized, err := json.Marshal(usuarioLogado)
 	if err != nil {
 		return nil, err
 	}
+	diferencaDeBytes := userlib.AESBlockSize - len(userSerialized)%userlib.AESBlockSize
+	cabecalhoEspacado := append([]byte{}, userSerialized...)
+	for i := 0; i < diferencaDeBytes; i++ {
+		cabecalhoEspacado = append(cabecalhoEspacado, byte(diferencaDeBytes))
+	}
 
 	iv := userlib.RandomBytes(userlib.AESBlockSize)
-	cipherText := userlib.SymEnc(key, iv, userSerialized)
-
+	cipherText := userlib.SymEnc(key, iv, cabecalhoEspacado)
+	identificadorDeArquivo, err := userlib.HMACEval(key, append([]byte("usuário:"+username), cipherText...))
+	if err != nil {
+		return nil, err
+	}
 	// Armazenando
-	userlib.DatastoreSet(userUUID, cipherText)
+	userlib.DatastoreSet(userUUID, append(cipherText, identificadorDeArquivo...))
 
 	return &usuarioLogado, nil
 }
@@ -177,34 +186,51 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 	var usuarioLogado User
 
 	// erro: Usuário ou senha inválido
-	if usuarioLogado.Username != username || usuarioLogado.Passowrd != password {
-		return nil, errors.New("Usuário ou senha inválidos")
+	if username == "" || password == "" {
+		return nil, errors.New("Esse nome e essa senha não existem seu borocoxo")
 	}
 
 	// Derivando UUID
-	salt := []byte(username)
-	key := userlib.Argon2Key([]byte(password), salt, uint32(userlib.AESKeySize))
+	key := userlib.Argon2Key([]byte(password), []byte(username), uint32(userlib.AESKeySize))
 	res, err := userlib.HMACEval(key, []byte(username)) // Pesquisar o que é a RES
-
 	if err != nil {
 		return nil, err
 	}
-
-	// cria o userUUID
 	userUUID := bytesToUUID(res)
 
+	// Verificando a integridade das cosa
+
+	usuarioNoBanco, ok := userlib.DatastoreGet(userUUID)
+	if !ok {
+		return nil, errors.New("Dados de usuário não encontrados")
+	}
+	if len(usuarioNoBanco) < userlib.AESBlockSize+len(res) {
+		return nil, errors.New("Dados de usuário corrompidos")
+	}
+
+	cipherText := usuarioNoBanco[:len(usuarioNoBanco)-len(res)]
+	identificadorDeArquivo := usuarioNoBanco[len(usuarioNoBanco)-len(res):]
+
+	esperado, err := userlib.HMACEval(key, append([]byte("usuário:"+username), cipherText...))
+	if err != nil {
+		return nil, err
+	}
+	if !userlib.HMACEqual(esperado, identificadorDeArquivo) {
+		return nil, errors.New("Usuário ou senha inválidos, ou dados corrompidos")
+	}
+
+	// Decodificando...
+	plainText := userlib.SymDec(key, cipherText) // Retorna um byte, que é o ciphertext;plaintext
+	if len(plainText) == 0 || plainText[len(plainText)-1] == 0 || int(plainText[len(plainText)-1]) > userlib.AESBlockSize || int(plainText[len(plainText)-1]) > len(plainText) {
+		return nil, errors.New("Dados de usuário corrompidos")
+	}
 	// Verificando se a senha está correta
+	plainText = plainText[:len(plainText)-int(plainText[len(plainText)-1])]
+
 	JSONerror := json.Unmarshal(plainText, &usuarioLogado)
 	if JSONerror != nil {
 		return nil, errors.New("senha ou usuário inválidos")
 	}
-	cipherText, ok := userlib.DatastoreGet(userUUID)
-
-	if !ok {
-		return nil, errors.New("Dados de usuário não encontrados")
-	}
-	plainText := userlib.SymDec(key, cipherText) // Retorna um byte, que é o ciphertext;plaintext
-
 	return &usuarioLogado, nil
 }
 
@@ -220,22 +246,43 @@ func (userdata *User) StoreFile(filename string, data []byte) {
 
 	// Chave especial
 	fileSpecificUser := []byte(userdata.Username + ":" + filename)
-	chaveDeArquivo, err := userlib.HMACEval(userdata.Salt, fileSpecificUser)
 
+	// UUID cabeçalho
+	chaveDoCabecalho, err := userlib.HMACEval(userdata.Salt, append([]byte("cabeçalho:"), fileSpecificUser...))
 	if err != nil {
 		return
 	}
-
 	// chaves do arquivo
-	fileUUID := bytesToUUID(chaveDeArquivo[:16])
+	fileKey := chaveDoCabecalho[:16]
+	cabecalhoUUID := bytesToUUID(fileKey)
+	fileUUID := uuid.New()
 
-	// Criptografando Data
+	// criptografando informações
+	diferencaDeBytes := userlib.AESBlockSize - len(data)%userlib.AESBlockSize
+	infoEspacada := append([]byte{}, data...)
+	for i := 0; i < diferencaDeBytes; i++ {
+		infoEspacada = append(infoEspacada, byte(diferencaDeBytes))
+	}
+
 	iv := userlib.RandomBytes(userlib.AESBlockSize)
-	cipherText := userlib.SymEnc(chaveDeArquivo[:16], iv, data)
+	cipherText := userlib.SymEnc(fileKey, iv, infoEspacada)
 
 	// Salvando a data
 
 	userlib.DatastoreSet(fileUUID, cipherText)
+
+	// para a leitura do LoadFile
+	cabecalhoEmJSON, err := json.Marshal(struct{ Blocks []uuid.UUID }{Blocks: []uuid.UUID{fileUUID}})
+	if err != nil {
+		return
+	}
+	diferencaDoCabecalho := userlib.AESBlockSize - len(cabecalhoEmJSON)%userlib.AESBlockSize
+	cabecalhoEspacado := append([]byte{}, cabecalhoEmJSON...)
+	for i := 0; i < diferencaDoCabecalho; i++ {
+		cabecalhoEspacado = append(cabecalhoEspacado, byte(diferencaDoCabecalho))
+	}
+	iv = userlib.RandomBytes(userlib.AESBlockSize)
+	userlib.DatastoreSet(cabecalhoUUID, userlib.SymEnc(fileKey, iv, cabecalhoEspacado))
 
 }
 
@@ -252,6 +299,7 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 	if HMAErr != nil {
 		return HMAErr
 	}
+
 	fileUUID := bytesToUUID(chaveDeArquivo[16:32])
 	chaveDeAdicao := bytesToUUID(chaveDeArquivo[:16])
 	fileKey := chaveDeArquivo[:16]
@@ -290,23 +338,29 @@ func (userdata *User) AppendFile(filename string, data []byte) (err error) {
 //
 // Deve retornar um erro se o arquivo estiver corrompido de qualquer forma.
 func (userdata *User) LoadFile(filename string) (data []byte, err error) {
-	// Encontrando usuário e gerando as chaves de acesso
 	fileSpecificUser := []byte(userdata.Username + ":" + filename)
-	chaveDeArquivo, err := userlib.HMACEval(userdata.Salt, fileSpecificUser)
+	chaveDoCabecalho, err := userlib.HMACEval(userdata.Salt, append([]byte("cabeçalho:"), fileSpecificUser...))
 	if err != nil {
 		return nil, err
 	}
-	// Cenário Benigno
-	fileKey := chaveDeArquivo[:16]
-	appendUUID := bytesToUUID(chaveDeArquivo[16:32])
 
-	// Obtendo e descriptando data
-	ciphertext, exists := userlib.DatastoreGet(appendUUID)
+	// Mesma chave usada no StoreFile para o cabeçalho
+	headerKey := chaveDoCabecalho[:16]
+	headerUUID := bytesToUUID(headerKey)
+
+	ciphertext, exists := userlib.DatastoreGet(headerUUID)
 	if !exists {
-		return nil, nil
+		return nil, errors.New("Arquivo não encontrado")
+	}
+	if len(ciphertext) < 2*userlib.AESBlockSize || len(ciphertext)%userlib.AESBlockSize != 0 {
+		return nil, errors.New("Arquivo ou Metadados Corrompidos")
 	}
 
-	headerJSON := userlib.SymDec(fileKey, ciphertext)
+	headerJSON := userlib.SymDec(headerKey, ciphertext)
+	if len(headerJSON) == 0 || headerJSON[len(headerJSON)-1] == 0 || int(headerJSON[len(headerJSON)-1]) > userlib.AESBlockSize || int(headerJSON[len(headerJSON)-1]) > len(headerJSON) {
+		return nil, errors.New("Arquivo ou Metadados Corrompidos")
+	}
+	headerJSON = headerJSON[:len(headerJSON)-int(headerJSON[len(headerJSON)-1])]
 
 	type fileHeader struct {
 		Blocks []uuid.UUID
@@ -319,12 +373,20 @@ func (userdata *User) LoadFile(filename string) (data []byte, err error) {
 
 	var result []byte
 	for _, blockUUID := range header.Blocks {
-		ciphertext, exists := userlib.DatastoreGet(blockUUID)
+		blockCiphertext, exists := userlib.DatastoreGet(blockUUID)
 		if !exists {
 			return nil, errors.New("Arquivo Corrompido")
 		}
+		if len(blockCiphertext) < 2*userlib.AESBlockSize || len(blockCiphertext)%userlib.AESBlockSize != 0 {
+			return nil, errors.New("Arquivo Corrompido")
+		}
 
-		result = append(result, userlib.SymDec(fileKey, ciphertext)...)
+		// Se no StoreFile o bloco foi cifrado com headerKey, use headerKey aqui também
+		blockPlain := userlib.SymDec(headerKey, blockCiphertext)
+		if len(blockPlain) == 0 || blockPlain[len(blockPlain)-1] == 0 || int(blockPlain[len(blockPlain)-1]) > userlib.AESBlockSize || int(blockPlain[len(blockPlain)-1]) > len(blockPlain) {
+			return nil, errors.New("Arquivo Corrompido")
+		}
+		result = append(result, blockPlain[:len(blockPlain)-int(blockPlain[len(blockPlain)-1])]...)
 	}
 
 	return result, nil
